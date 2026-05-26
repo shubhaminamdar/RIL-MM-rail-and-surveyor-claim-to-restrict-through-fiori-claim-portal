@@ -1,0 +1,170 @@
+================================================================================
+  CURSOR CHANGE SUMMARY - MM FIORI RAIL CLAIM CUTOFF (FS v1.1)
+  Function Module: /RWHM/Z_FIORI_CLAIM_SEARCH_RL
+  Date: May 2026
+  Reference FS: FS-MM fiori rail claim cutoff1.docx
+  Reference Files:
+    - Updated FM source     : rail code.txt
+    - Modified FM (tagged)  : Z_FIORI_CLAIM_SEARCH_RL_MODIFIED.txt
+================================================================================
+
+DELTA FROM PREVIOUS FS (cutoff.docx -> cutoff1.docx)
+----------------------------------------------------
+The earlier implementation always read LR_DT from ZTRSTLMNT_RAIL.
+FS cutoff1.docx requires LR_DT retrieval based on FM input I_SRCHTYP:
+
+  I_SRCHTYP = 2 (rail / existing claim search type gc_2):
+    - LR_DT  from ZTRSTLMNT_RAIL-TKNUM
+    - SHTYP, TPLST from VTTK-TKNUM
+
+  I_SRCHTYP = 1 (road shipment search type gc_1):
+    - SHTYP, TPLST from VTTK-TKNUM
+    - LR_DT  from YTTSTX0002-SHNUMBER (= shipment)
+    - If no YTTSTX0002 row: YTTSTX0001-SHNUMBER -> REPORT_NO,
+      then YTTSTX0002-REPORT_NO -> LR_DT
+
+  I_SRCHTYP = 3 (lc_3): cutoff block not executed (not in FS).
+
+Steps 2-5 (ZLOG_EXEC_VAR config, SHTYP/TPLST match, date compare, Fr8First
+error) are unchanged from the prior FS.
+
+
+--------------------------------------------------------------------------------
+REQUIREMENT 1a: I_SRCHTYP = 2 — Rail shipment LR date
+--------------------------------------------------------------------------------
+
+ADDED/MODIFIED - Branch inside LOOP AT lt_pod (cutoff block):
+
+  IF i_srchtyp EQ gc_2.
+    SELECT SINGLE lr_dt FROM ztrstlmnt_rail
+      INTO lw_rail_lr_dt WHERE tknum = lw_pod-tknum.
+    IF sy-subrc = 0 AND lw_rail_lr_dt IS NOT INITIAL.
+      SELECT SINGLE shtyp tplst FROM vttk
+        INTO CORRESPONDING FIELDS OF lw_vttk_ril
+        WHERE tknum = lw_pod-tknum.
+      IF sy-subrc = 0.
+        lv_vttk_ok = abap_true.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+--------------------------------------------------------------------------------
+REQUIREMENT 1b: I_SRCHTYP = 1 — Road shipment LR date (YTTS tables)
+--------------------------------------------------------------------------------
+
+ADDED - DATA variable:
+  lw_report_no TYPE yttstx0001-report_no
+
+ADDED - Branch for road search:
+
+  ELSEIF i_srchtyp EQ gc_1.
+    SELECT SINGLE shtyp tplst FROM vttk ... WHERE tknum = lw_pod-tknum.
+    IF sy-subrc = 0.
+      lv_vttk_ok = abap_true.
+      SELECT SINGLE lr_dt FROM yttstx0002
+        INTO lw_rail_lr_dt WHERE shnumber = lw_pod-tknum.
+      IF sy-subrc NE 0.
+        SELECT SINGLE report_no FROM yttstx0001
+          INTO lw_report_no WHERE shnumber = lw_pod-tknum.
+        IF sy-subrc = 0 AND lw_report_no IS NOT INITIAL.
+          SELECT SINGLE lr_dt FROM yttstx0002
+            INTO lw_rail_lr_dt WHERE report_no = lw_report_no.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+--------------------------------------------------------------------------------
+REQUIREMENT 1c: Unified LR_DT variable and VTTK gate
+--------------------------------------------------------------------------------
+
+MODIFIED - Data type:
+  lw_rail_lr_dt TYPE sy-datum   (was ztrstlmnt_rail-lr_dt; holds ZTRSTLMNT_RAIL
+                                  or YTTSTX0002 LR_DT per search type)
+
+ADDED - Data variable:
+  lv_vttk_ok TYPE char1   (set when VTTK read succeeds for srchtyp 1 or 2)
+
+ADDED - Common compare (only when lv_vttk_ok = X AND lw_rail_lr_dt filled):
+
+  READ TABLE lt_ril_cutoff WITH KEY shtyp / transplpt
+  DATE_CONVERT_TO_INTERNAL on REMARKS (fallback remarks+0(8))
+  IF lw_rail_lr_dt > lv_cutoff_dt -> error RETURN
+
+
+--------------------------------------------------------------------------------
+REQUIREMENTS 2-5: Unchanged from prior implementation
+--------------------------------------------------------------------------------
+
+  - CONSTANT lc_ril_cutoff = ZSCM_RIL_CUTOFF_DATE
+  - SELECT lt_ril_cutoff from ZLOG_EXEC_VAR (ACTIVE = X) before POD loop
+  - Match VTTK-SHTYP = config-SHTYP, VTTK-TPLST = config-TRANPLPT
+  - Error: 'Shipment to be claimed through Fr8First'(212)
+  - If LR_DT <= cutoff: continue existing FCPL/list logic
+
+
+--------------------------------------------------------------------------------
+CHANGE HISTORY ENTRY
+--------------------------------------------------------------------------------
+
+ADDED:
+  SrNo 4 | May-2026 | Cursor | Cutoff LR by I_SRCHTYP (FS v1.1) | YTTSTX0001/0002
+
+
+================================================================================
+SUMMARY TABLE OF CHANGES (FS cutoff1)
+================================================================================
+
+  #   | Change Type | Location                    | Description
+  ----|-------------|-----------------------------|-----------------------------
+  1   | MODIFIED    | DATA lw_rail_lr_dt          | TYPE sy-datum (multi-source LR)
+  2   | ADDED       | DATA                        | lw_report_no, lv_vttk_ok
+  3   | MODIFIED    | LOOP AT lt_pod cutoff block | Split by I_SRCHTYP gc_1 / gc_2
+  4   | ADDED       | I_SRCHTYP = gc_2 branch     | ZTRSTLMNT_RAIL + VTTK
+  5   | ADDED       | I_SRCHTYP = gc_1 branch     | VTTK + YTTSTX0002/0001 fallback
+  6   | MODIFIED    | Compare block               | Runs only if lv_vttk_ok and LR_DT set
+  7   | ADDED       | CHANGE HISTORY #4           | FS v1.1 documentation
+
+
+================================================================================
+FLOW (mermaid)
+================================================================================
+
+  lt_ril_cutoff loaded from ZLOG_EXEC_VAR
+           |
+           v
+  LOOP AT lt_pod
+           |
+     +-----+-----+
+     |           |
+  I_SRCHTYP=2  I_SRCHTYP=1
+     |           |
+  ZTRSTLMNT    VTTK -> YTTSTX0002 (SHNUMBER)
+  _RAIL+VTTK       | not found?
+     |           YTTSTX0001 -> YTTSTX0002 (REPORT_NO)
+     +-----+-----+
+           |
+  lv_vttk_ok AND lw_rail_lr_dt filled?
+           | yes
+  Match config SHTYP/TPLST
+           |
+  LR_DT > REMARKS? --> ERROR Fr8First / RETURN
+           | no
+  Continue FCPL + list build
+
+
+================================================================================
+NOTE
+================================================================================
+
+All tagged lines are in Z_FIORI_CLAIM_SEARCH_RL_MODIFIED.txt (>>>>CURSOR: markers).
+Clean transport copy: rail code.txt
+
+Verify in SAP:
+  - Text element 212 for Fr8First message
+  - ZLOG_EXEC_VAR maintenance for ZSCM_RIL_CUTOFF_DATE
+  - YTTSTX0002 has SHNUMBER and LR_DT fields in your client (per FS)
+
+================================================================================

@@ -25,12 +25,13 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
 * 1  |25-06-2018 | RIGV_010 | Adding DWARF logic existing claim
 * 2  |           |          |               |                 |
 * 3  |May-2026   | Cursor   | RIL Fr8First rail claim cutoff  | ZSCM_RIL_CUTOFF_DATE
+* 4  |May-2026   | Cursor   | Cutoff LR by I_SRCHTYP (FS v1.1)| YTTSTX0001/0002 road
 *----------------------------------------------------------------------*
-*  >>>>CURSOR CHANGE LOG (FS-MM Fiori Rail Claim Cutoff - May 2026):
-*    REQ 1: ZTRSTLMNT_RAIL-LR_DT + VTTK-SHTYP/TPLST for input shipment
-*    REQ 2: ZLOG_EXEC_VAR config NAME = ZSCM_RIL_CUTOFF_DATE, ACTIVE = X
-*    REQ 3: Match VTTK-SHTYP = config-SHTYP and VTTK-TPLST = config-TRANPLPT
-*    REQ 4-5: If LR_DT > config-REMARKS (cutoff) -> error Fr8First; else continue
+*  >>>>CURSOR CHANGE LOG (FS-MM fiori rail claim cutoff1.docx - May 2026):
+*    REQ 1a: I_SRCHTYP=2 -> LR_DT from ZTRSTLMNT_RAIL, SHTYP/TPLST from VTTK
+*    REQ 1b: I_SRCHTYP=1 -> SHTYP/TPLST from VTTK; LR_DT from YTTSTX0002-SHNUMBER
+*            fallback YTTSTX0001-SHNUMBER -> REPORT_NO -> YTTSTX0002-LR_DT
+*    REQ 2-5: ZSCM_RIL_CUTOFF_DATE match and LR_DT vs REMARKS (unchanged)
 *  >>>>CURSOR CHANGE LOG END
 *----------------------------------------------------------------------*
   TYPES: BEGIN OF lty_detail,
@@ -49,7 +50,6 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
     name          TYPE rvari_vnam,
     remarks       TYPE char70,
     END OF ty_stl_t.
-* >>>>CURSOR:ADDED - Types for RIL Fr8First rail claim cutoff (FS-MM Fiori Rail Claim Cutoff)
   TYPES: BEGIN OF lty_ril_cutoff,
            shtyp     TYPE zlog_exec_var-shtyp,
            transplpt TYPE zlog_exec_var-transplpt,
@@ -59,7 +59,6 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
            shtyp TYPE vttk-shtyp,
            tplst TYPE vttk-tplst,
          END OF lty_vttk_ril.
-* >>>>CURSOR:ADDED END
   DATA: lt_tknum TYPE RANGE OF tknum,"STANDARD TABLE OF ty_tknum,
 *        lw_tknum TYPE ty_tknum,
         lt_rr_no TYPE RANGE OF ztarget_voy,
@@ -86,13 +85,15 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
         lw_bukrs TYPE bukrs,
         lw_flag_lr  TYPE flag,
         lw_para_dt  TYPE sy-datum,
-* >>>>CURSOR:ADDED - Data for RIL Fr8First rail claim cutoff
         lt_ril_cutoff   TYPE STANDARD TABLE OF lty_ril_cutoff,
         lw_ril_cutoff   TYPE lty_ril_cutoff,
         lw_vttk_ril      TYPE lty_vttk_ril,
-        lw_rail_lr_dt    TYPE ztrstlmnt_rail-lr_dt,
+* >>>>CURSOR:MODIFIED - lw_rail_lr_dt generic; added lw_report_no, lv_vttk_ok (FS cutoff1)
+        lw_rail_lr_dt    TYPE sy-datum,
+        lw_report_no     TYPE yttstx0001-report_no,
+        lv_vttk_ok       TYPE char1,
         lv_cutoff_dt     TYPE sy-datum.
-* >>>>CURSOR:ADDED END
+* >>>>CURSOR:MODIFIED END
 *        lw_pod_option   LIKE LINE OF lt_pod_option.
 
 
@@ -137,9 +138,7 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
               gc_name TYPE rvari_vnam VALUE 'ZSCE_CONTTYPE_DWARF',
               lc_fcpl_live   TYPE rvari_vnam VALUE 'ZSCE_FCPL_LIVE',
               lc_fcpl TYPE bukrs VALUE 'FCPL',
-* >>>>CURSOR:ADDED - RIL Fr8First cutoff config name in ZLOG_EXEC_VAR
               lc_ril_cutoff  TYPE rvari_vnam VALUE 'ZSCM_RIL_CUTOFF_DATE'.
-* >>>>CURSOR:ADDED END
 
   CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
     EXPORTING
@@ -383,7 +382,6 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
     CLEAR: lw_live_flg.
   ENDIF.
 
-* >>>>CURSOR:ADDED - Load RIL Fr8First cutoff config from ZLOG_EXEC_VAR (REQ 2)
   CLEAR: lt_ril_cutoff[].
   SELECT shtyp
          transplpt
@@ -392,7 +390,6 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
     INTO TABLE lt_ril_cutoff
     WHERE name   = lc_ril_cutoff
       AND active = abap_true.
-* >>>>CURSOR:ADDED END
 
   LOOP AT lt_pod INTO lw_pod.
     lw_list-tknum     = lw_pod-tknum.
@@ -402,46 +399,82 @@ FUNCTION /rwhm/z_fiori_claim_search_rl.
     lw_list-lr_no     = lw_pod-lr_no.
     lw_list-lr_dt     = lw_pod-lr_dt.
 
-* >>>>CURSOR:ADDED BEGIN - RIL Fr8First rail claim cutoff check (REQ 1-5)
+* >>>>CURSOR:MODIFIED BEGIN - LR_DT source by I_SRCHTYP (FS cutoff1 REQ 1)
     IF lt_ril_cutoff IS NOT INITIAL.
-      CLEAR: lw_rail_lr_dt, lw_vttk_ril, lw_ril_cutoff, lv_cutoff_dt.
-      SELECT SINGLE lr_dt
-        FROM ztrstlmnt_rail
-        INTO lw_rail_lr_dt
-        WHERE tknum = lw_pod-tknum.
-      IF sy-subrc = 0 AND lw_rail_lr_dt IS NOT INITIAL.
+      CLEAR: lw_rail_lr_dt, lw_vttk_ril, lw_ril_cutoff, lv_cutoff_dt,
+             lw_report_no, lv_vttk_ok.
+
+      IF i_srchtyp EQ gc_2.
+* >>>>CURSOR:ADDED - Rail search: ZTRSTLMNT_RAIL + VTTK
+        SELECT SINGLE lr_dt
+          FROM ztrstlmnt_rail
+          INTO lw_rail_lr_dt
+          WHERE tknum = lw_pod-tknum.
+        IF sy-subrc = 0 AND lw_rail_lr_dt IS NOT INITIAL.
+          SELECT SINGLE shtyp
+                 tplst
+            FROM vttk
+            INTO CORRESPONDING FIELDS OF lw_vttk_ril
+            WHERE tknum = lw_pod-tknum.
+          IF sy-subrc = 0.
+            lv_vttk_ok = abap_true.
+          ENDIF.
+        ENDIF.
+      ELSEIF i_srchtyp EQ gc_1.
+* >>>>CURSOR:ADDED - Road search: VTTK + YTTSTX0002/0001 fallback for LR_DT
         SELECT SINGLE shtyp
                tplst
           FROM vttk
           INTO CORRESPONDING FIELDS OF lw_vttk_ril
           WHERE tknum = lw_pod-tknum.
         IF sy-subrc = 0.
-          READ TABLE lt_ril_cutoff INTO lw_ril_cutoff
-            WITH KEY shtyp     = lw_vttk_ril-shtyp
-                     transplpt = lw_vttk_ril-tplst.
-          IF sy-subrc = 0 AND lw_ril_cutoff-remarks IS NOT INITIAL.
-            CALL FUNCTION 'DATE_CONVERT_TO_INTERNAL'
-              EXPORTING
-                date_external = lw_ril_cutoff-remarks
-              IMPORTING
-                date_internal = lv_cutoff_dt
-              EXCEPTIONS
-                OTHERS = 1.
-            IF sy-subrc NE 0.
-              lv_cutoff_dt = lw_ril_cutoff-remarks+0(8).
-            ENDIF.
-            IF lv_cutoff_dt IS NOT INITIAL AND lw_rail_lr_dt > lv_cutoff_dt.
-              lw_return-type = gc_e.
-              lw_return-message = 'Shipment to be claimed through Fr8First'(212).
-              APPEND lw_return TO et_return.
-              CLEAR lw_return.
-              RETURN.
+          lv_vttk_ok = abap_true.
+          SELECT SINGLE lr_dt
+            FROM yttstx0002
+            INTO lw_rail_lr_dt
+            WHERE shnumber = lw_pod-tknum.
+          IF sy-subrc NE 0.
+            SELECT SINGLE report_no
+              FROM yttstx0001
+              INTO lw_report_no
+              WHERE shnumber = lw_pod-tknum.
+            IF sy-subrc = 0 AND lw_report_no IS NOT INITIAL.
+              SELECT SINGLE lr_dt
+                FROM yttstx0002
+                INTO lw_rail_lr_dt
+                WHERE report_no = lw_report_no.
             ENDIF.
           ENDIF.
         ENDIF.
       ENDIF.
+
+* >>>>CURSOR:ADDED - Common cutoff compare when VTTK and LR_DT available
+      IF lv_vttk_ok = abap_true AND lw_rail_lr_dt IS NOT INITIAL.
+        READ TABLE lt_ril_cutoff INTO lw_ril_cutoff
+          WITH KEY shtyp     = lw_vttk_ril-shtyp
+                   transplpt = lw_vttk_ril-tplst.
+        IF sy-subrc = 0 AND lw_ril_cutoff-remarks IS NOT INITIAL.
+          CALL FUNCTION 'DATE_CONVERT_TO_INTERNAL'
+            EXPORTING
+              date_external = lw_ril_cutoff-remarks
+            IMPORTING
+              date_internal = lv_cutoff_dt
+            EXCEPTIONS
+              OTHERS = 1.
+          IF sy-subrc NE 0.
+            lv_cutoff_dt = lw_ril_cutoff-remarks+0(8).
+          ENDIF.
+          IF lv_cutoff_dt IS NOT INITIAL AND lw_rail_lr_dt > lv_cutoff_dt.
+            lw_return-type = gc_e.
+            lw_return-message = 'Shipment to be claimed through Fr8First'(212).
+            APPEND lw_return TO et_return.
+            CLEAR lw_return.
+            RETURN.
+          ENDIF.
+        ENDIF.
+      ENDIF.
     ENDIF.
-* >>>>CURSOR:ADDED END - RIL Fr8First rail claim cutoff check
+* >>>>CURSOR:MODIFIED END - LR_DT source by I_SRCHTYP
 
     IF lw_live_flg = abap_true.
       lw_lr_dt = lw_pod-lr_dt.
