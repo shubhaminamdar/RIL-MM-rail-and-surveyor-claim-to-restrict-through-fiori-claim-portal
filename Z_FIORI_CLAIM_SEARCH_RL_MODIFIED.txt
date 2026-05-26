@@ -1,0 +1,555 @@
+FUNCTION /rwhm/z_fiori_claim_search_rl.
+*"----------------------------------------------------------------------
+*"*"Local Interface:
+*"  IMPORTING
+*"     VALUE(I_FLAG) TYPE  CHAR2
+*"     VALUE(I_LIFNR) TYPE  LIFNR
+*"     VALUE(I_SRCHTYP) TYPE  CHAR1
+*"     VALUE(IT_REFNO) TYPE  /RWHM/Z_CLAIM_REFNO_TT
+*"  EXPORTING
+*"     VALUE(ET_LIST) TYPE  /RWHM/Z_CLAIM_SCRH_RL_ITEM_TT
+*"     VALUE(ET_RETURN) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+  " **----------------------------------------------------------------------*
+* Create Date         : 04-02-2017
+* Release             : 6.0
+* Technical Author    : Hardik Bhatia
+* Functional Author   : Ketan Sethi/Piyush Gurjar
+*----------------------------------------------------------------------*
+* Description  : claim search rail
+*----------------------------------------------------------------------*
+* CHANGE HISTORY
+*----------------------------------------------------------------------*
+*SrNo| Date      | User ID |  Description  |  Change Label   |
+*----------------------------------------------------------------------*
+* 1  |25-06-2018 | RIGV_010 | Adding DWARF logic existing claim
+* 2  |           |          |               |                 |
+* 3  |May-2026   | Cursor   | RIL Fr8First rail claim cutoff  | ZSCM_RIL_CUTOFF_DATE
+*----------------------------------------------------------------------*
+*  >>>>CURSOR CHANGE LOG (FS-MM Fiori Rail Claim Cutoff - May 2026):
+*    REQ 1: ZTRSTLMNT_RAIL-LR_DT + VTTK-SHTYP/TPLST for input shipment
+*    REQ 2: ZLOG_EXEC_VAR config NAME = ZSCM_RIL_CUTOFF_DATE, ACTIVE = X
+*    REQ 3: Match VTTK-SHTYP = config-SHTYP and VTTK-TPLST = config-TRANPLPT
+*    REQ 4-5: If LR_DT > config-REMARKS (cutoff) -> error Fr8First; else continue
+*  >>>>CURSOR CHANGE LOG END
+*----------------------------------------------------------------------*
+  TYPES: BEGIN OF lty_detail,
+        zotknum TYPE zlog_mm_detail-zotknum,
+        zrtknum TYPE zlog_mm_detail-zrtknum,
+      END  OF lty_detail.
+
+  TYPES: BEGIN OF ty_voyage,
+    voyage         TYPE ztarget_voy,
+    END OF ty_voyage.
+  TYPES:BEGIN OF ty_dwarf,
+    zconttype	     TYPE zconttyp,
+    zrtknum	       TYPE zrtknum,
+    END OF ty_dwarf.
+  TYPES:BEGIN OF ty_stl_t,
+    name          TYPE rvari_vnam,
+    remarks       TYPE char70,
+    END OF ty_stl_t.
+* >>>>CURSOR:ADDED - Types for RIL Fr8First rail claim cutoff (FS-MM Fiori Rail Claim Cutoff)
+  TYPES: BEGIN OF lty_ril_cutoff,
+           shtyp     TYPE zlog_exec_var-shtyp,
+           transplpt TYPE zlog_exec_var-transplpt,
+           remarks   TYPE zlog_exec_var-remarks,
+         END OF lty_ril_cutoff.
+  TYPES: BEGIN OF lty_vttk_ril,
+           shtyp TYPE vttk-shtyp,
+           tplst TYPE vttk-tplst,
+         END OF lty_vttk_ril.
+* >>>>CURSOR:ADDED END
+  DATA: lt_tknum TYPE RANGE OF tknum,"STANDARD TABLE OF ty_tknum,
+*        lw_tknum TYPE ty_tknum,
+        lt_rr_no TYPE RANGE OF ztarget_voy,
+        lw_rrno LIKE LINE OF lt_rr_no,
+        lt_tknumr TYPE  efg_tab_ranges,
+        lw_tknumr1 LIKE LINE OF lt_tknumr,
+*        lt_tknumr TYPE efg_tab_ranges,
+        lw_tknum LIKE LINE OF lt_tknum,
+        lw_return LIKE LINE OF et_return,
+        lw_refno LIKE LINE OF it_refno,
+        lw_list LIKE LINE OF et_list,
+        lt_detail TYPE TABLE OF lty_detail,
+        lw_detail LIKE LINE OF lt_detail,
+        lt_pod    TYPE STANDARD TABLE OF zrl_inw_pod,
+        lt_log    TYPE TABLE OF zrl_inw_log,
+        lw_log    LIKE LINE OF lt_log,
+        lw_pod LIKE LINE OF lt_pod,
+        lt_pod_option        TYPE TABLE OF  zrail_pod_option,
+        lv_flag   TYPE c,
+        lt_dwarf    TYPE STANDARD TABLE OF  ty_dwarf,
+        lw_dwarf    TYPE ty_dwarf,
+        lw_live_flg TYPE  char1,
+        lw_lr_dt    TYPE sy-datum,
+        lw_bukrs TYPE bukrs,
+        lw_flag_lr  TYPE flag,
+        lw_para_dt  TYPE sy-datum,
+* >>>>CURSOR:ADDED - Data for RIL Fr8First rail claim cutoff
+        lt_ril_cutoff   TYPE STANDARD TABLE OF lty_ril_cutoff,
+        lw_ril_cutoff   TYPE lty_ril_cutoff,
+        lw_vttk_ril      TYPE lty_vttk_ril,
+        lw_rail_lr_dt    TYPE ztrstlmnt_rail-lr_dt,
+        lv_cutoff_dt     TYPE sy-datum.
+* >>>>CURSOR:ADDED END
+*        lw_pod_option   LIKE LINE OF lt_pod_option.
+
+
+  TYPES : BEGIN OF lty_zlog_rake_cost,
+           zrakeid   TYPE zlog_rake_cost-zrakeid,
+           zrvend    TYPE zlog_rake_cost-zrvend,
+           voyage    TYPE zlog_rake_cost-voyage,
+         END OF lty_zlog_rake_cost.
+
+  TYPES: BEGIN OF lty_zlog_mm_detail,
+          zrakeid     TYPE zlog_mm_detail-zrakeid,
+          zrtknum     TYPE zlog_mm_detail-zrtknum,
+        END OF lty_zlog_mm_detail.
+
+  TYPES:BEGIN OF ty_rtknum,
+          rtknum      TYPE zrtknum,
+    END OF ty_rtknum.
+  DATA : lt_zlog_rake_cost TYPE TABLE OF lty_zlog_rake_cost,
+         lt_zlog_rake_cost_t TYPE TABLE OF lty_zlog_rake_cost,
+         lw_zlog_rake_cost TYPE lty_zlog_rake_cost.
+  DATA : lt_zlog_mm_detail TYPE TABLE OF lty_zlog_mm_detail,
+         lw_zlog_mm_detail TYPE lty_zlog_mm_detail.
+
+  DATA: lw_qty_i      TYPE ztrstlmnt-v_dlv_qty,
+        lw_uom        TYPE t006-msehi,
+        lw_qty_o      TYPE ztrstlmnt-v_dlv_qty,
+        lt_voyage     TYPE STANDARD TABLE OF ty_voyage,
+        lt_voyage_t   TYPE STANDARD TABLE OF ty_voyage,
+        lw_voyage     TYPE ty_voyage,
+        lt_rtknum     TYPE STANDARD TABLE OF ty_rtknum, "RANGE OF zrtknum,
+        lt_rtknum_t   TYPE STANDARD TABLE OF ty_rtknum, "RANGE OF zrtknum,
+        lw_rtknum     TYPE ty_rtknum, "LIKE LINE OF lt_rtknum,
+        lt_stl_t      TYPE STANDARD TABLE OF ty_stl_t,
+        lw_stl_t      TYPE ty_stl_t.
+* BOC Santhosh Chowdary
+  DATA: lt_road_ship        TYPE zscm_tknum_tt,
+        lw_road_ship        TYPE zscm_tknum,
+        lw_rail_ship        TYPE  zscm_rail_ship,
+        lt_rail_ship        TYPE  zscm_rail_ship_tt.
+*EOC Santhosh Chowdary
+  CONSTANTS : lc_3 TYPE c  VALUE '3',
+              gc_name TYPE rvari_vnam VALUE 'ZSCE_CONTTYPE_DWARF',
+              lc_fcpl_live   TYPE rvari_vnam VALUE 'ZSCE_FCPL_LIVE',
+              lc_fcpl TYPE bukrs VALUE 'FCPL',
+* >>>>CURSOR:ADDED - RIL Fr8First cutoff config name in ZLOG_EXEC_VAR
+              lc_ril_cutoff  TYPE rvari_vnam VALUE 'ZSCM_RIL_CUTOFF_DATE'.
+* >>>>CURSOR:ADDED END
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = i_lifnr
+    IMPORTING
+      output = i_lifnr.
+
+  LOOP AT it_refno INTO lw_refno.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = lw_refno-refno
+      IMPORTING
+        output = lw_tknum-low.
+
+*    BOC Santhosh chowdary
+    lw_road_ship-tknum = lw_tknum-low.
+    APPEND lw_road_ship TO lt_road_ship.
+    CLEAR lw_road_ship.
+*    EOC Santhosh Chowdary
+
+    lw_voyage-voyage = lw_tknum-low.
+    APPEND lw_voyage TO lt_voyage.
+    CLEAR lw_voyage.
+    lw_tknum-sign = gc_i.
+    lw_tknum-option = gc_eq.
+
+    APPEND lw_tknum TO lt_tknum.
+    APPEND lw_tknum TO lt_tknumr.
+    CLEAR lw_tknum.
+  ENDLOOP.
+
+  IF i_srchtyp EQ lc_3.
+
+    lt_voyage_t = lt_voyage.
+    SORT lt_voyage_t BY voyage.
+    DELETE lt_voyage_t WHERE voyage IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_voyage_t COMPARING voyage.
+    IF lt_voyage_t IS NOT INITIAL.
+      SELECT zrakeid
+             zrvend
+             voyage  FROM zlog_rake_cost
+           CLIENT SPECIFIED
+           INTO TABLE lt_zlog_rake_cost
+        FOR ALL ENTRIES IN lt_voyage_t
+        WHERE mandt = sy-mandt
+          AND voyage = lt_voyage_t-voyage.
+      IF sy-subrc IS NOT INITIAL.
+        lw_return-type = gc_e.
+        lw_return-message = 'Rail Receipt not found'(206).
+        APPEND lw_return TO et_return.
+        CLEAR lw_return.
+        RETURN.
+*    ELSE.
+      ENDIF.
+      CLEAR lt_voyage_t.
+    ENDIF.
+
+    lt_zlog_rake_cost_t = lt_zlog_rake_cost.
+    SORT lt_zlog_rake_cost_t BY zrakeid.
+    DELETE ADJACENT DUPLICATES FROM lt_zlog_rake_cost_t COMPARING zrakeid.
+    IF lt_zlog_rake_cost_t IS NOT INITIAL.
+      SELECT zrakeid
+             zrtknum
+        FROM zlog_mm_detail
+        INTO TABLE lt_zlog_mm_detail
+        FOR ALL ENTRIES IN lt_zlog_rake_cost_t
+        WHERE zrakeid = lt_zlog_rake_cost_t-zrakeid.
+      IF sy-subrc IS INITIAL.
+        SORT lt_zlog_mm_detail BY zrtknum .
+        DELETE lt_zlog_mm_detail WHERE zrtknum IS INITIAL.
+        DELETE ADJACENT DUPLICATES FROM lt_zlog_mm_detail COMPARING  zrtknum .
+        IF lt_zlog_mm_detail IS NOT INITIAL.
+          LOOP AT lt_zlog_mm_detail INTO lw_zlog_mm_detail.
+            lw_tknum-low =  lw_zlog_mm_detail-zrtknum.
+            lw_tknum-sign = gc_i.
+            lw_tknum-option = gc_eq.
+            lv_flag = 'X'.
+            APPEND lw_tknum TO lt_tknum.
+            APPEND lw_tknum TO lt_tknumr.
+            CLEAR lw_tknum.
+          ENDLOOP.
+        ELSE.
+          lw_return-type = gc_e.
+          lw_return-message = 'Rail Receipt not found'(206).
+          APPEND lw_return TO et_return.
+          CLEAR lw_return.
+          RETURN.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+*    ENDIF.
+  ENDIF.
+
+  IF i_srchtyp EQ gc_1. "road shipment
+    SELECT zotknum
+           zrtknum
+      FROM zlog_mm_detail CLIENT SPECIFIED
+      INTO TABLE lt_detail
+      WHERE mandt = sy-mandt AND zotknum IN lt_tknum.
+    IF sy-subrc NE 0.
+      CLEAR lt_rail_ship.
+      CALL FUNCTION 'Z_ROAD_RAIL_SHIPMENT'
+        EXPORTING
+          it_road_ship = lt_road_ship
+        IMPORTING
+          et_rail_ship = lt_rail_ship.
+      IF lt_rail_ship IS NOT INITIAL.
+        LOOP AT lt_rail_ship INTO lw_rail_ship.
+          lw_detail-zotknum = lw_rail_ship-road_shipment.
+          lw_detail-zrtknum = lw_rail_ship-rail_shipment.
+          APPEND lw_detail TO lt_detail.
+          CLEAR lw_detail.
+        ENDLOOP.
+      ELSE.
+        lw_return-type = gc_e.
+        lw_return-message = 'Rail shipment not found'(113).
+        APPEND lw_return TO et_return.
+        CLEAR lw_return.
+        RETURN.
+      ENDIF.
+    ENDIF.
+*    LOOP AT lt_voyage INTO lw_voyage.
+*      lw_rtknum-low =  lw_voyage-voyage.
+*      lw_rtknum-sign = 'I'.
+*      lw_rtknum-option = 'EQ'.
+*      APPEND lw_rtknum TO lt_rtknum.
+*      CLEAR lw_rtknum.
+*    ENDLOOP.
+
+
+    DELETE lt_detail WHERE zrtknum IS INITIAL.
+    SORT lt_detail BY zrtknum.
+    DELETE ADJACENT DUPLICATES FROM lt_detail COMPARING zrtknum.
+
+    IF lt_detail IS NOT INITIAL.
+
+      REFRESH: lt_tknum , lt_tknumr.
+      LOOP AT lt_detail INTO lw_detail.
+        lw_tknum-low =  lw_detail-zrtknum.
+        lw_tknum-sign = gc_i.
+        lw_tknum-option = gc_eq.
+
+        APPEND lw_tknum TO lt_tknum.
+        APPEND lw_tknum TO lt_tknumr.
+        CLEAR lw_tknum.
+      ENDLOOP.
+
+
+    ELSE.
+      lw_return-type = gc_e.
+      lw_return-message = 'Rail shipment not found'(112).
+      APPEND lw_return TO et_return.
+      CLEAR lw_return.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  IF i_srchtyp EQ gc_2.
+    LOOP AT lt_voyage INTO lw_voyage.
+      lw_rtknum-rtknum =  lw_voyage-voyage.
+*      lw_rtknum-sign = 'I'.
+*      lw_rtknum-option = 'EQ'.
+      APPEND lw_rtknum TO lt_rtknum.
+      CLEAR lw_rtknum.
+    ENDLOOP.
+    lt_rtknum_t = lt_rtknum.
+    SORT lt_rtknum_t BY rtknum.
+    DELETE lt_rtknum_t WHERE rtknum IS INITIAL.
+    DELETE ADJACENT DUPLICATES FROM lt_rtknum_t COMPARING rtknum.
+    IF lt_rtknum_t IS NOT INITIAL.
+
+      SELECT zconttype
+             zrtknum
+        FROM zlog_mm_detail
+        INTO TABLE lt_dwarf
+        FOR ALL ENTRIES IN lt_rtknum_t
+        WHERE zrtknum = lt_rtknum_t-rtknum. "lt_voyage-voyage.
+      IF sy-subrc = 0.
+        SELECT name
+               remarks
+          FROM zlog_stlmntvr
+          INTO TABLE lt_stl_t
+          WHERE name = gc_name
+            AND active = abap_true.
+        IF sy-subrc NE 0.
+          CLEAR lt_stl_t.
+        ENDIF.
+      ENDIF.
+      CLEAR lt_rtknum_t.
+    ENDIF.
+    LOOP AT lt_dwarf INTO lw_dwarf.
+      READ TABLE lt_stl_t INTO lw_stl_t WITH KEY remarks = lw_dwarf-zconttype.
+      IF sy-subrc = 0.
+        lv_flag = 'X'.
+      ENDIF.
+    ENDLOOP.
+
+  ENDIF.
+
+  CALL FUNCTION '/RWHM/Z_INOWIT_RAIL_READ_MUL'
+    EXPORTING
+      i_lifnr            = i_lifnr
+      i_tknum_t          = lt_tknumr
+    TABLES
+      it_rail_inw_pod    = lt_pod
+      it_rail_pod_option = lt_pod_option
+      it_log             = lt_log.
+
+
+  DELETE lt_log WHERE msgtyp NE gc_e.
+  LOOP AT lt_log INTO lw_log.
+    lw_return-type = gc_e.
+    lw_return-message = lw_log-message.
+    APPEND lw_return TO et_return.
+  ENDLOOP.
+
+  READ TABLE et_return TRANSPORTING NO FIELDS WITH KEY type = gc_e.
+  IF sy-subrc EQ 0.
+    RETURN.
+  ENDIF.
+
+  IF lt_pod_option IS INITIAL.
+    lw_return-type = gc_e.
+    lw_return-message = 'Does not contain any POD Types to process'(111).
+    APPEND lw_return TO et_return.
+    CLEAR : lw_return.
+    RETURN.
+  ENDIF.
+
+  SORT lt_pod_option BY tknum.
+  SORT lt_pod BY tknum.
+
+  SELECT active
+            UP TO 1 ROWS
+            FROM zlog_stlmntvr
+            INTO lw_live_flg
+            WHERE name   = lc_fcpl_live
+            AND  active = abap_true.
+  ENDSELECT.
+  IF  sy-subrc <> 0.
+    CLEAR: lw_live_flg.
+  ENDIF.
+
+* >>>>CURSOR:ADDED - Load RIL Fr8First cutoff config from ZLOG_EXEC_VAR (REQ 2)
+  CLEAR: lt_ril_cutoff[].
+  SELECT shtyp
+         transplpt
+         remarks
+    FROM zlog_exec_var
+    INTO TABLE lt_ril_cutoff
+    WHERE name   = lc_ril_cutoff
+      AND active = abap_true.
+* >>>>CURSOR:ADDED END
+
+  LOOP AT lt_pod INTO lw_pod.
+    lw_list-tknum     = lw_pod-tknum.
+    lw_list-vbeln     = lw_pod-vbeln.
+    lw_list-counter   = lw_pod-counter.
+    lw_list-vsart     = lw_pod-vsart.
+    lw_list-lr_no     = lw_pod-lr_no.
+    lw_list-lr_dt     = lw_pod-lr_dt.
+
+* >>>>CURSOR:ADDED BEGIN - RIL Fr8First rail claim cutoff check (REQ 1-5)
+    IF lt_ril_cutoff IS NOT INITIAL.
+      CLEAR: lw_rail_lr_dt, lw_vttk_ril, lw_ril_cutoff, lv_cutoff_dt.
+      SELECT SINGLE lr_dt
+        FROM ztrstlmnt_rail
+        INTO lw_rail_lr_dt
+        WHERE tknum = lw_pod-tknum.
+      IF sy-subrc = 0 AND lw_rail_lr_dt IS NOT INITIAL.
+        SELECT SINGLE shtyp
+               tplst
+          FROM vttk
+          INTO CORRESPONDING FIELDS OF lw_vttk_ril
+          WHERE tknum = lw_pod-tknum.
+        IF sy-subrc = 0.
+          READ TABLE lt_ril_cutoff INTO lw_ril_cutoff
+            WITH KEY shtyp     = lw_vttk_ril-shtyp
+                     transplpt = lw_vttk_ril-tplst.
+          IF sy-subrc = 0 AND lw_ril_cutoff-remarks IS NOT INITIAL.
+            CALL FUNCTION 'DATE_CONVERT_TO_INTERNAL'
+              EXPORTING
+                date_external = lw_ril_cutoff-remarks
+              IMPORTING
+                date_internal = lv_cutoff_dt
+              EXCEPTIONS
+                OTHERS = 1.
+            IF sy-subrc NE 0.
+              lv_cutoff_dt = lw_ril_cutoff-remarks+0(8).
+            ENDIF.
+            IF lv_cutoff_dt IS NOT INITIAL AND lw_rail_lr_dt > lv_cutoff_dt.
+              lw_return-type = gc_e.
+              lw_return-message = 'Shipment to be claimed through Fr8First'(212).
+              APPEND lw_return TO et_return.
+              CLEAR lw_return.
+              RETURN.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+* >>>>CURSOR:ADDED END - RIL Fr8First rail claim cutoff check
+
+    IF lw_live_flg = abap_true.
+      lw_lr_dt = lw_pod-lr_dt.
+
+      "Class to determine a company code for shipment
+      CALL METHOD zcl_fcpl_bukrs=>ship_bukrs
+        EXPORTING
+          im_tknum = lw_pod-tknum
+        IMPORTING
+          ex_bukrs = lw_bukrs.
+      IF lw_bukrs = lc_fcpl.        "If Company code is 'FCPL'
+        "zcl_log_fcpl class to identify whether company code and CN date is active for FCPL or not
+        "Method fcpl_applicable will return true (X) if company code is FCPL
+        "and CN date is >= go-live date in RP2 related servers and clients
+        CALL METHOD zcl_log_fcpl=>fcpl_applicable
+          EXPORTING
+            lp_bukrs    = lw_bukrs
+            lp_date     = lw_lr_dt
+          IMPORTING
+            lp_fcpl_app = lw_flag_lr
+            lp_para_dt  = lw_para_dt.
+        "If Company Code is 'FCPL'  & Lr_date is >= QWIK Go-Live date, no need to display in portal
+        IF lw_flag_lr EQ abap_true.
+          lw_return-type = 'E'.
+          CONCATENATE 'Shipments From LR dt :'(210)  lw_para_dt+6(2) ':' lw_para_dt+4(2) ':' lw_para_dt+0(4) 'to be claimed from QWIK portal'(211)
+          INTO lw_return-message
+          SEPARATED BY space.
+          APPEND lw_return TO et_return.
+          CLEAR lw_return.
+          RETURN.
+        ENDIF.
+      ENDIF.
+      CLEAR: lw_lr_dt,lw_bukrs,lw_flag_lr,lw_para_dt.
+    ENDIF.
+    IF lw_pod-st_uom NE gc_kg AND lw_pod-st_uom NE gc_mt.
+      lw_qty_i = lw_pod-shd_qty.
+      CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+        EXPORTING
+          input                = lw_qty_i
+          unit_in              = lw_uom
+          unit_out             = gc_mt
+        IMPORTING
+          output               = lw_qty_o
+        EXCEPTIONS
+          conversion_not_found = 1
+          division_by_zero     = 2
+          input_invalid        = 3
+          output_invalid       = 4
+          overflow             = 5
+          type_invalid         = 6
+          units_missing        = 7
+          unit_in_not_found    = 8
+          unit_out_not_found   = 9
+          OTHERS               = 10.
+      lw_list-st_qty    = lw_qty_o.
+    ELSE.
+      lw_list-st_qty    = lw_pod-shd_qty.
+    ENDIF.
+    lw_list-st_uom    = gc_mt. "lw_pod-st_uom.
+    lw_list-cont_num  = lw_pod-cont_number.
+    lw_list-matkl     = lw_pod-matkl.
+    lw_list-v_dlv_dt  = lw_pod-delv_date.
+    lw_list-v_dlv_qty = lw_pod-delv_qty.
+    IF lw_pod-uom EQ gc_kg.
+      lw_list-v_dlv_qty = lw_pod-delv_qty / 1000.
+    ENDIF.
+
+    lw_list-v_dlv_uom = gc_mt.
+
+    IF lw_pod-pod_status_rail EQ '04'.
+      AT NEW tknum.
+        READ TABLE lt_pod_option TRANSPORTING NO FIELDS WITH KEY tknum = lw_pod-tknum BINARY SEARCH.
+        IF sy-subrc NE 0.
+          lw_return-type = 'E'.
+          CONCATENATE 'POD is completed for shipment'(105) lw_pod-tknum
+          INTO lw_return-message
+          SEPARATED BY space.
+          APPEND lw_return TO et_return.
+          CLEAR lw_return.
+          CONTINUE.
+        ENDIF.
+      ENDAT.
+    ENDIF.
+
+    SHIFT lw_list-lr_no LEFT DELETING LEADING '0'.
+    SHIFT lw_list-cont_num LEFT DELETING LEADING '0'.
+    IF lv_flag = 'X'.
+*      lw_list-flag = 'X'.
+      lw_list-dwrf_ind = 'X'.
+    ENDIF.
+    APPEND lw_list TO et_list.
+    CLEAR :lw_list,lw_pod.
+  ENDLOOP.
+  IF lv_flag NE 'X'.
+    LOOP AT lt_tknumr INTO lw_tknumr1.
+      READ TABLE lt_pod INTO lw_pod WITH KEY tknum = lw_tknumr1-low
+                                             BINARY SEARCH.
+      IF sy-subrc NE 0.
+        lw_return-type = gc_e.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = lw_tknumr1-low
+          IMPORTING
+            output = lw_tknumr1-low.
+        CONCATENATE ' Invalid Shipment Number- '(062) lw_tknumr1-low INTO lw_return-message SEPARATED BY space.
+        APPEND lw_return TO et_return.
+        CLEAR : lw_return ,lw_tknumr1.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+ENDFUNCTION.
